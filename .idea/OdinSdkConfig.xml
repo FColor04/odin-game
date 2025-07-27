@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="com.lasagnerd.odin.settings.OdinSdkConfigPersistentState">
+    <option name="sdkPath" value="$USER_HOME$/scoop/apps/odin/current" />
+    <option name="semanticAnnotatorEnabled" value="true" />
+    <option name="odinCheckerEnabled" value="true" />
+    <option name="debuggerId" value="odin-win-db-dap" />
+    <option name="debuggerPath" value="C:\Users\FColor04\AppData\Local\JetBrains\CLion2025.1\odin\debuggers\odin-win-db-dap\extension\debugAdapters\vsdbg\bin\vsdbg.exe" />
+    <option name="highlightUnknownReferencesEnabled" value="true" />
+    <option name="conditionalSymbolResolutionEnabled" value="false" />
+    <option name="cacheEnabled" value="true" />
+  </component>
+</project>
