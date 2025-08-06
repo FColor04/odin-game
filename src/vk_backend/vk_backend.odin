@@ -1,11 +1,10 @@
 ﻿package vk_backend
 
-import "core:c"
+import "base:runtime"
 import fmt "core:fmt"
 import os "core:os"
-import "vendor:glfw"
+import "vendor:sdl3"
 import vk "vendor:vulkan"
-import windows "core:sys/windows"
 import shader "../shader"
 import mem "core:mem"
 
@@ -16,12 +15,13 @@ Context :: struct
     instance: vk.Instance,
     device:   vk.Device,
     physical_device: vk.PhysicalDevice,
+    debug_messenger: vk.DebugUtilsMessengerEXT,
     swap_chain: Swapchain,
     pipeline: Pipeline,
     queue_indices:   [QueueFamily]int,
     queues:   [QueueFamily]vk.Queue,
     surface:  vk.SurfaceKHR,
-    window:   glfw.WindowHandle,
+    window:   ^sdl3.Window,
     command_pool: vk.CommandPool,
     command_buffers: [MAX_FRAMES_IN_FLIGHT]vk.CommandBuffer,
     vertex_buffer: Buffer,
@@ -114,29 +114,26 @@ init :: proc (using ctx: ^Context, vertices: []Vertex, indices: []u16) {
 }
 
 deinit :: proc (using ctx: ^Context) {
-    vk.DeviceWaitIdle(device);
     deinit_vulkan(ctx);
 }
 
 init_vulkan :: proc(using ctx: ^Context, vertices: []Vertex, indices: []u16)
 {
-    context.user_ptr = &instance;
-    get_proc_address :: proc(p: rawptr, name: cstring)
-    {
-        (cast(^rawptr)p)^ = glfw.GetInstanceProcAddress((^vk.Instance)(context.user_ptr)^, name);
-    }
+    context.user_ptr = ctx;
+// Load initial Vulkan procedures
+    vk.load_proc_addresses(cast(rawptr)sdl3.Vulkan_GetVkGetInstanceProcAddr());
 
-    vk.load_proc_addresses(get_proc_address);
     create_instance(ctx);
-    vk.load_proc_addresses(get_proc_address);
+    // Load instance-specific procedures after creating instance
+    vk.load_proc_addresses_instance(instance);
 
     extensions := get_extensions();
     for &ext in &extensions do fmt.println(cstring(raw_data(&ext.extensionName)));
 
+    create_debug_messenger(ctx);
+
     create_surface(ctx);
-
     get_suitable_device(ctx);
-
     find_queue_families(ctx);
 
     fmt.println("Queue Indices:");
@@ -144,8 +141,9 @@ init_vulkan :: proc(using ctx: ^Context, vertices: []Vertex, indices: []u16)
 
     create_device(ctx);
 
-    for &q, f in &queues
-    {
+    vk.load_proc_addresses_device(device);
+
+    for &q, f in &queues {
         vk.GetDeviceQueue(device, u32(queue_indices[f]), 0, &q);
     }
 
@@ -158,12 +156,14 @@ init_vulkan :: proc(using ctx: ^Context, vertices: []Vertex, indices: []u16)
     create_index_buffer(ctx, indices);
     create_command_buffers(ctx);
     create_sync_objects(ctx);
-
-    return;
 }
 
 deinit_vulkan :: proc(using ctx: ^Context)
 {
+    if device != {} {
+        vk.DeviceWaitIdle(device);
+    }
+    
     cleanup_swap_chain(ctx);
 
     vk.FreeMemory(device, index_buffer.memory, nil);
@@ -185,8 +185,9 @@ deinit_vulkan :: proc(using ctx: ^Context)
     }
     vk.DestroyCommandPool(device, command_pool, nil);
 
+    vk.DestroyDebugUtilsMessengerEXT(instance, debug_messenger, nil);
     vk.DestroyDevice(device, nil);
-    vk.DestroySurfaceKHR(instance, surface, nil);
+    sdl3.Vulkan_DestroySurface(ctx.instance, ctx.surface, nil);
     vk.DestroyInstance(instance, nil);
 }
 
@@ -194,7 +195,7 @@ create_instance :: proc(using ctx: ^Context)
 {
     app_info: vk.ApplicationInfo;
     app_info.sType = .APPLICATION_INFO;
-    app_info.pApplicationName = "Hello Triangle";
+    app_info.pApplicationName = "Vulkan!";
     app_info.applicationVersion = vk.MAKE_VERSION(0, 0, 1);
     app_info.pEngineName = "No Engine";
     app_info.engineVersion = vk.MAKE_VERSION(1, 0, 0);
@@ -203,43 +204,86 @@ create_instance :: proc(using ctx: ^Context)
     create_info: vk.InstanceCreateInfo;
     create_info.sType = .INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &app_info;
-    glfw_ext := glfw.GetRequiredInstanceExtensions();
-    create_info.ppEnabledExtensionNames = raw_data(glfw_ext);
-    create_info.enabledExtensionCount = cast(u32)len(glfw_ext);
 
-    when ODIN_DEBUG
-    {
+    instance_extensions_count := u32(0);
+    instance_extensions_c := sdl3.Vulkan_GetInstanceExtensions(&instance_extensions_count);
+    
+    instance_extensions := make([dynamic]cstring, instance_extensions_count + 1);
+    assign_at(&instance_extensions, instance_extensions_count, vk.EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+    for ext, i in instance_extensions_c[:instance_extensions_count] {
+        assign_at(&instance_extensions, i, ext);
+    }
+    for ext in instance_extensions {
+        fmt.println(ext);
+    }
+    
+    create_info.ppEnabledExtensionNames = raw_data(instance_extensions);
+    create_info.enabledExtensionCount = u32(len(instance_extensions));
+    
+    when ODIN_DEBUG {
         layer_count: u32;
         vk.EnumerateInstanceLayerProperties(&layer_count, nil);
         layers := make([]vk.LayerProperties, layer_count);
+        defer delete(layers);
         vk.EnumerateInstanceLayerProperties(&layer_count, raw_data(layers));
 
-        outer: for name in VALIDATION_LAYERS
-        {
-            for &layer in &layers
-            {
-                if name == cstring(raw_data(&layer.layerName)) do continue outer;
+        outer: for name in VALIDATION_LAYERS {
+            for &layer in &layers {
+                layer_name := cstring(raw_data(&layer.layerName));
+                if name == layer_name do continue outer;
             }
             fmt.eprintf("ERROR: validation layer %q not available\n", name);
-            os.exit(1);
+            os.exit(1); // Uncomment this to enforce validation layers
         }
-        
-create_info.ppEnabledLayerNames = &VALIDATION_LAYERS[0];
+
+        create_info.ppEnabledLayerNames = &VALIDATION_LAYERS[0];
         create_info.enabledLayerCount = len(VALIDATION_LAYERS);
         fmt.println("Validation Layers Loaded");
-    }
-    else
-    {
+    } else {
         create_info.enabledLayerCount = 0;
+        create_info.pNext = nil;
     }
-    
-if (vk.CreateInstance(&create_info, nil, &instance) != .SUCCESS)
-{
-    fmt.eprintf("ERROR: Failed to create instance\n");
-    return;
+
+    if (vk.CreateInstance(&create_info, nil, &instance) != .SUCCESS) {
+        fmt.eprintfln("ERROR: Failed to create instance: {0}", sdl3.GetError());
+        os.exit(1);
+    }
+
+    fmt.printfln("Instance Created: {0}", instance);
 }
-    
-fmt.println("Instance Created");
+
+create_debug_messenger :: proc(using ctx: ^Context) {
+    when ODIN_DEBUG {
+        create_info: vk.DebugUtilsMessengerCreateInfoEXT;
+        create_info.sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+        create_info.messageSeverity = {.WARNING, .ERROR};
+        create_info.messageType = {.GENERAL, .VALIDATION, .PERFORMANCE};
+        create_info.pfnUserCallback = debug_callback;
+
+        // Get the function pointer
+        vkCreateDebugUtilsMessengerEXT := cast(vk.ProcCreateDebugUtilsMessengerEXT)vk.GetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+        
+        if vkCreateDebugUtilsMessengerEXT == nil {
+            fmt.eprintfln("ERROR: Could not load vkCreateDebugUtilsMessengerEXT");
+            return;
+        }
+
+        if vkCreateDebugUtilsMessengerEXT(instance, &create_info, nil, &debug_messenger) != .SUCCESS {
+            fmt.eprintfln("ERROR: Failed to create debug messenger");
+        }
+    }
+}
+
+debug_callback :: proc "system" (
+messageSeverity: vk.DebugUtilsMessageSeverityFlagsEXT,
+messageType: vk.DebugUtilsMessageTypeFlagsEXT,
+pCallbackData: ^vk.DebugUtilsMessengerCallbackDataEXT,
+pUserData: rawptr,
+) -> b32 {
+    context = runtime.default_context();
+    fmt.eprintfln("Validation layer: {}", pCallbackData.pMessage);
+    return false;
 }
 
 get_extensions :: proc() -> []vk.ExtensionProperties
@@ -254,14 +298,11 @@ get_extensions :: proc() -> []vk.ExtensionProperties
 
 create_surface :: proc(using ctx: ^Context)
 {
-    surface_create_info := vk.Win32SurfaceCreateInfoKHR{};
-    surface_create_info.sType= .WIN32_SURFACE_CREATE_INFO_KHR;
-    surface_create_info.hwnd = glfw.GetWin32Window(window);
-    surface_create_info.hinstance = cast(vk.HANDLE)windows.GetModuleHandleA(nil);
-
-    if res := glfw.CreateWindowSurface(instance, window, nil, &surface); res != .SUCCESS
+    width, height :i32 = 0, 0;
+    sdl3.GetWindowSize(&window^, &width, &height);
+    if !sdl3.Vulkan_CreateSurface(window, instance, nil, &surface)
     {
-        fmt.eprintf("ERROR: Failed to create window surface\n");
+        fmt.eprintfln("ERROR: Failed to create surface {0} {1}", sdl3.GetError(), &instance);
         os.exit(1);
     }
 }
@@ -323,7 +364,7 @@ get_suitable_device :: proc(using ctx: ^Context)
         return score;
     }
     
-hiscore := 0;
+    hiscore := 0;
     for dev in devices
     {
         score := suitability(ctx, dev);
@@ -334,11 +375,11 @@ hiscore := 0;
         }
     }
     
-if (hiscore == 0)
-{
-    fmt.eprintf("ERROR: Failed to find a suitable GPU\n");
-    os.exit(1);
-}
+    if (hiscore == 0)
+    {
+        fmt.eprintf("ERROR: Failed to find a suitable GPU\n");
+        os.exit(1);
+    }
 }
 
 find_queue_families :: proc(using ctx: ^Context)
@@ -393,7 +434,7 @@ create_device :: proc(using ctx: ^Context)
 
     if vk.CreateDevice(physical_device, &device_create_info, nil, &device) != .SUCCESS
     {
-        fmt.eprintf("ERROR: Failed to create logical device\n");
+        fmt.eprintln("ERROR: Failed to create logical device\n");
         os.exit(1);
     }
 }
@@ -403,10 +444,16 @@ query_swap_chain_details :: proc(using ctx: ^Context, dev: vk.PhysicalDevice)
     vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(dev, surface, &swap_chain.support.capabilities);
 
     format_count: u32;
-    vk.GetPhysicalDeviceSurfaceFormatsKHR(dev, surface, &format_count, nil);
+
+    result := vk.GetPhysicalDeviceSurfaceFormatsKHR(dev, surface, &format_count, nil);
+    if(result != .SUCCESS) {
+        fmt.eprintfln("ERROR: Failed to get physical device formats {0}", result)
+    }
     if format_count > 0
     {
         swap_chain.support.formats = make([]vk.SurfaceFormatKHR, format_count);
+        
+        fmt.println("Getting formats into formats var");
         vk.GetPhysicalDeviceSurfaceFormatsKHR(dev, surface, &format_count, raw_data(swap_chain.support.formats));
     }
     
@@ -415,6 +462,7 @@ query_swap_chain_details :: proc(using ctx: ^Context, dev: vk.PhysicalDevice)
     if present_mode_count > 0
     {
         swap_chain.support.present_modes = make([]vk.PresentModeKHR, present_mode_count);
+        
         vk.GetPhysicalDeviceSurfacePresentModesKHR(dev, surface, &present_mode_count, raw_data(swap_chain.support.present_modes));
     }
 }
@@ -426,7 +474,9 @@ choose_surface_format :: proc(using ctx: ^Context) -> vk.SurfaceFormatKHR
         if v.format == .B8G8R8A8_SRGB && v.colorSpace == .SRGB_NONLINEAR do return v;
     }
     
-return swap_chain.support.formats[0];
+    assert(len(swap_chain.support.formats) != 0, "Available swap chain formats should never be 0");
+    
+    return swap_chain.support.formats[0];
 }
 
 choose_present_mode :: proc(using ctx: ^Context) -> vk.PresentModeKHR
@@ -443,8 +493,11 @@ choose_swap_extent :: proc(using ctx: ^Context) -> vk.Extent2D
 {
 //    if (swap_chain.support.capabilities.currentExtent.width != max(u32)) 
 //        return swap_chain.support.capabilities.currentExtent;
-    width, height := glfw.GetFramebufferSize(window);
-
+//    width, height := glfw.GetFramebufferSize(window);
+    width, height : i32 = 0, 0;
+    sdl3.GetWindowSizeInPixels(&ctx.window^, &width, &height);
+    
+    
     fmt.printfln("{0} {1}", width, height);
     fmt.printfln("{0} {1}", swap_chain.support.capabilities.maxImageExtent.width, swap_chain.support.capabilities.maxImageExtent.height);
     
@@ -759,6 +812,7 @@ create_render_pass :: proc(using ctx: ^Context)
 create_framebuffers :: proc(using ctx: ^Context)
 {
     swap_chain.framebuffers = make([]vk.Framebuffer, len(swap_chain.image_views));
+    
     for v, i in swap_chain.image_views
     {
         attachments := [?]vk.ImageView{v};
@@ -877,27 +931,27 @@ create_sync_objects :: proc(using ctx: ^Context)
     fence_info.sType = .FENCE_CREATE_INFO;
     fence_info.flags = {.SIGNALED}
     
-for i in 0..<MAX_FRAMES_IN_FLIGHT
-{
-    res := vk.CreateSemaphore(device, &semaphore_info, nil, &image_available[i]);
-    if res != .SUCCESS
+    for i in 0..<MAX_FRAMES_IN_FLIGHT
     {
-        fmt.eprintf("Error: Failed to create \"image_available\" semaphore\n");
-        os.exit(1);
+        res := vk.CreateSemaphore(device, &semaphore_info, nil, &image_available[i]);
+        if res != .SUCCESS
+        {
+            fmt.eprintf("Error: Failed to create \"image_available\" semaphore\n");
+            os.exit(1);
+        }
+        res = vk.CreateSemaphore(device, &semaphore_info, nil, &render_finished[i]);
+        if res != .SUCCESS
+        {
+            fmt.eprintf("Error: Failed to create \"render_finished\" semaphore\n");
+            os.exit(1);
+        }
+        res = vk.CreateFence(device, &fence_info, nil, &in_flight[i]);
+        if res != .SUCCESS
+        {
+            fmt.eprintf("Error: Failed to create \"in_flight\" fence\n");
+            os.exit(1);
+        }
     }
-    res = vk.CreateSemaphore(device, &semaphore_info, nil, &render_finished[i]);
-    if res != .SUCCESS
-    {
-        fmt.eprintf("Error: Failed to create \"render_finished\" semaphore\n");
-        os.exit(1);
-    }
-    res = vk.CreateFence(device, &fence_info, nil, &in_flight[i]);
-    if res != .SUCCESS
-    {
-        fmt.eprintf("Error: Failed to create \"in_flight\" fence\n");
-        os.exit(1);
-    }
-}
 }
 
 recreate_vertex_buffer :: proc(using ctx: ^Context, vertices: []Vertex) {
@@ -920,19 +974,20 @@ recreate_vertex_buffer :: proc(using ctx: ^Context, vertices: []Vertex) {
 
 recreate_swap_chain :: proc(using ctx: ^Context)
 {
-    width, height := glfw.GetFramebufferSize(window);
-    for width == 0 && height == 0
-    {
-        width, height = glfw.GetFramebufferSize(window);
-        glfw.WaitEvents();
+    width, height : i32 = 0, 0;
+    sdl3.GetWindowSize(&ctx.window^, &width, &height);
+    if width == 0 && height == 0 {
+        ctx.framebuffer_resized = true;
+        return;
     }
     vk.DeviceWaitIdle(device);
     
-    query_swap_chain_details(ctx, physical_device);
-    
     cleanup_framebuffer_and_images(ctx);
     old_handle := swap_chain.handle;
-    create_swap_chain(ctx, ctx.swap_chain.handle);
+    
+    create_swap_chain(ctx);
+    
+
     vk.DestroySwapchainKHR(device, old_handle, nil);
 
     create_image_views(ctx);
